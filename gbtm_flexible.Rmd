@@ -1,0 +1,896 @@
+---
+title: "Flexible GBTM Implementation: NB/ZIP/ZINB"
+output: html_notebook
+---
+
+This notebook implements Group-Based Trajectory Modeling with flexible distribution choices.
+You can easily switch between: Poisson, ZIP (Zero-Inflated Poisson), NB (Negative Binomial), 
+and ZINB (Zero-Inflated Negative Binomial).
+
+# Setup and Data Loading
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(flexmix)
+library(ggplot2)
+library(gridExtra)
+library(knitr)
+library(corrplot)
+
+# For NB models
+if (!require("countreg", quietly = TRUE)) {
+  # countreg is on R-Forge, not CRAN
+  install.packages("countreg", repos="http://R-Forge.R-project.org")
+}
+library(countreg)
+
+# For ZIP/ZINB if we need custom implementation
+if (!require("pscl", quietly = TRUE)) {
+  install.packages("pscl")
+}
+library(pscl)
+
+# Load data
+patient_demographics <- read_csv("tb_patient_demographics.csv")
+quarterly_visits <- read_csv("tb_quarterly_visits.csv")
+```
+
+# Data Preparation
+
+```{r data_prep}
+gbtm_data <- quarterly_visits %>%
+  left_join(patient_demographics, by = "patient_id") %>%
+  arrange(patient_id, quarter_id) %>%
+  mutate(
+    patient_numeric = as.numeric(factor(patient_id)),
+    time = quarter_id - 1  # zero indexing
+  ) %>%
+  mutate(  # binary indicators for covariates
+    male = ifelse(sex == "male", 1, 0),
+    ds_tb = ifelse(drug_resistance == "Drug-sensitive", 1, 0),
+    lung = ifelse(tb_type == "Pulmonary", 1, 0),
+    sputum = ifelse(baseline_sputum_smear == "Positive", 1, 0)
+  ) %>%
+  filter(!is.na(hospital_visits))
+
+# Data summary
+cat("Total observations:", nrow(gbtm_data), "\n")
+cat("Unique patients:", length(unique(gbtm_data$patient_id)), "\n")
+cat("Time points:", length(unique(gbtm_data$time)), "\n")
+cat("Time range:", min(gbtm_data$time), "to", max(gbtm_data$time), "\n")
+```
+
+# Exploratory Analysis
+
+## Spaghetti Plot
+
+```{r spaghetti_plot, fig.width=10, fig.height=6}
+set.seed(1008)
+sample_patients <- gbtm_data %>%
+  distinct(patient_id) %>%
+  slice_sample(n = 100) %>%
+  pull(patient_id)
+
+spaghetti_data <- gbtm_data %>%
+  filter(patient_id %in% sample_patients)
+
+ggplot(spaghetti_data, aes(x = time, y = hospital_visits, group = patient_id)) +
+  geom_line(alpha = 0.3, color = "steelblue") +
+  geom_smooth(aes(group = 1), method = "loess", se = TRUE, color = "red", linewidth = 1.5) +
+  labs(
+    title = "Individual Trajectory Patterns, Sampled (n = 100)",
+    x = "Quarters Since Treatment",
+    y = "Number of Hospital Visits"
+  ) +
+  theme_minimal()
+```
+
+## Distribution Diagnostics
+
+```{r distribution_diagnostics}
+# Overall zero rate
+zero_rate <- mean(gbtm_data$hospital_visits == 0) * 100
+cat("Overall zero rate:", round(zero_rate, 1), "%\n\n")
+
+# Overdispersion check (overall)
+mean_visits <- mean(gbtm_data$hospital_visits)
+var_visits <- var(gbtm_data$hospital_visits)
+dispersion_overall <- var_visits / mean_visits
+
+cat("Overall statistics:\n")
+cat("  Mean:", round(mean_visits, 2), "\n")
+cat("  Variance:", round(var_visits, 2), "\n")
+cat("  Dispersion ratio (Var/Mean):", round(dispersion_overall, 2), "\n\n")
+
+if (dispersion_overall > 1.5) {
+  cat("CONCLUSION: Strong overdispersion → Use NB or ZINB\n")
+} else if (dispersion_overall > 1.1) {
+  cat("CONCLUSION: Moderate overdispersion → NB recommended\n")
+} else {
+  cat("CONCLUSION: No overdispersion → Poisson or ZIP acceptable\n")
+}
+
+# Check for structural zeros (patients with ALL zeros)
+patient_zero_pattern <- gbtm_data %>%
+  group_by(patient_id) %>%
+  summarise(
+    total_quarters = n(),
+    zero_quarters = sum(hospital_visits == 0),
+    pct_zeros = zero_quarters / total_quarters * 100,
+    max_visits = max(hospital_visits)
+  )
+
+cat("\n\nZero pattern by patient:\n")
+cat("  Patients with ALL zeros:", 
+    sum(patient_zero_pattern$pct_zeros == 100), 
+    "(", round(mean(patient_zero_pattern$pct_zeros == 100) * 100, 1), "%)\n")
+cat("  Patients with SOME zeros:", 
+    sum(patient_zero_pattern$pct_zeros > 0 & patient_zero_pattern$pct_zeros < 100),
+    "(", round(mean(patient_zero_pattern$pct_zeros > 0 & patient_zero_pattern$pct_zeros < 100) * 100, 1), "%)\n")
+cat("  Patients with NO zeros:", 
+    sum(patient_zero_pattern$pct_zeros == 0),
+    "(", round(mean(patient_zero_pattern$pct_zeros == 0) * 100, 1), "%)\n")
+
+# Histogram of zero percentage distribution
+hist(patient_zero_pattern$pct_zeros,
+     main = "Distribution of % Zero Quarters per Patient",
+     xlab = "% of Quarters with Zero Visits",
+     col = "lightblue",
+     breaks = 20)
+```
+
+# Model Configuration
+
+**SWITCH MODELS HERE:** Change the `model_type` variable to switch between distributions.
+
+```{r model_config}
+# ========================================
+# CONFIGURATION: Change model type here
+# ========================================
+# Options: "poisson", "nb", "zip", "zinb"
+model_type <- "nb"  # <--- CHANGE THIS TO SWITCH MODELS
+# ========================================
+
+cat("Selected model type:", toupper(model_type), "\n")
+```
+
+# Helper Functions for Model Fitting
+
+```{r helper_functions}
+#' Create flexmix model driver based on distribution type
+#' 
+#' @param type One of "poisson", "nb", "zip", "zinb"
+#' @return flexmix model driver object
+create_model_driver <- function(type = "nb") {
+  
+  driver <- switch(type,
+    "poisson" = {
+      cat("Using Poisson distribution (no overdispersion, no zero-inflation)\n")
+      FLXMRglm(family = "poisson")
+    },
+    
+    "nb" = {
+      cat("Using Negative Binomial distribution (handles overdispersion)\n")
+      FLXMRnegbin()
+    },
+    
+    "zip" = {
+      cat("Using Zero-Inflated Poisson distribution\n")
+      FLXMRziglm(family = "poisson")
+    },
+    
+    "zinb" = {
+      stop("ZINB not directly supported by flexmix. See custom implementation section below.")
+    },
+    
+    stop("Invalid model type. Choose: 'poisson', 'nb', 'zip', or 'zinb'")
+  )
+  
+  return(driver)
+}
+
+
+#' Fit GBTM with specified distribution
+#' 
+#' @param data Data frame in long format
+#' @param k Number of trajectory classes
+#' @param model_type Distribution type
+#' @param formula Formula for trajectories (default: quadratic time)
+#' @param id_var Name of patient ID variable
+#' @return flexmix object
+fit_gbtm <- function(data, 
+                     k, 
+                     model_type = "nb",
+                     formula = hospital_visits ~ time + I(time^2),
+                     id_var = "patient_id") {
+  
+  # Create model driver
+  model_driver <- create_model_driver(model_type)
+  
+  # Create formula with ID clustering
+  # flexmix uses | to specify grouping variable
+  full_formula <- as.formula(paste(deparse(formula), "|", id_var))
+  
+  cat("\nFitting", k, "class", toupper(model_type), "GBTM model...\n")
+  cat("Formula:", deparse(full_formula), "\n")
+  
+  # Fit model
+  set.seed(1008)  # For reproducibility
+  
+  fit <- tryCatch({
+    flexmix(
+      formula = full_formula,
+      data = data,
+      k = k,
+      model = model_driver,
+      control = list(
+        minprior = 0.05,      # Minimum class size (5%)
+        iter.max = 500,       # Maximum iterations
+        tolerance = 1e-6,     # Convergence tolerance
+        verbose = 1           # Print progress
+      )
+    )
+  }, error = function(e) {
+    cat("Error fitting model:", e$message, "\n")
+    return(NULL)
+  })
+  
+  if (!is.null(fit)) {
+    cat("Model converged successfully!\n")
+    cat("Log-likelihood:", logLik(fit), "\n")
+    cat("AIC:", AIC(fit), "\n")
+    cat("BIC:", BIC(fit), "\n")
+  }
+  
+  return(fit)
+}
+
+
+#' Extract posterior probabilities and class assignments
+#' 
+#' @param model flexmix object
+#' @return Data frame with patient_id, predicted_class, and posterior probabilities
+extract_class_assignments <- function(model, data) {
+  
+  # Get posterior probabilities (one row per patient)
+  post_probs <- posterior(model)
+  
+  # Get class assignments (which class has highest probability)
+  class_assign <- clusters(model)
+  
+  # Get unique patient IDs in order
+  patient_ids <- data %>%
+    distinct(patient_id) %>%
+    pull(patient_id)
+  
+  # Create output data frame
+  assignments <- data.frame(
+    patient_id = patient_ids,
+    predicted_class = class_assign,
+    post_probs  # This adds prob_1, prob_2, etc. columns
+  )
+  
+  # Calculate max posterior probability for each patient
+  prob_cols <- grep("^Comp\\.", names(assignments), value = TRUE)
+  assignments$max_posterior_prob <- apply(assignments[, prob_cols], 1, max)
+  
+  return(assignments)
+}
+```
+
+# Fit 1-Class Baseline Model
+
+This serves as a baseline for model comparison and can be used for initialization.
+
+```{r fit_1class}
+model_1class <- fit_gbtm(
+  data = gbtm_data,
+  k = 1,
+  model_type = model_type
+)
+
+# Store fit statistics
+fit_1class_stats <- data.frame(
+  k = 1,
+  loglik = logLik(model_1class),
+  aic = AIC(model_1class),
+  bic = BIC(model_1class)
+)
+
+print(fit_1class_stats)
+```
+
+# Fit 4-Class Model
+
+Based on your prior knowledge that 4 classes exist in the data.
+
+```{r fit_4class}
+model_4class <- fit_gbtm(
+  data = gbtm_data,
+  k = 4,
+  model_type = model_type
+)
+
+# Model comparison
+fit_4class_stats <- data.frame(
+  k = 4,
+  loglik = logLik(model_4class),
+  aic = AIC(model_4class),
+  bic = BIC(model_4class)
+)
+
+# Compare to 1-class
+cat("\n=== Model Comparison ===\n")
+comparison <- rbind(fit_1class_stats, fit_4class_stats)
+print(comparison)
+
+cat("\nBIC improvement (1-class to 4-class):", 
+    round(fit_1class_stats$bic - fit_4class_stats$bic, 1), "\n")
+
+if (fit_4class_stats$bic < fit_1class_stats$bic) {
+  cat("→ 4-class model is superior\n")
+} else {
+  cat("→ 1-class model is preferred (unexpected!)\n")
+}
+
+# Model summary
+summary(model_4class)
+```
+
+# Extract Class Assignments
+
+```{r extract_assignments}
+# Get class assignments with posterior probabilities
+class_assignments <- extract_class_assignments(model_4class, gbtm_data)
+
+# Class sizes
+cat("\n=== Class Sizes ===\n")
+class_sizes <- table(class_assignments$predicted_class)
+print(class_sizes)
+cat("\nProportions:\n")
+print(round(prop.table(class_sizes) * 100, 1))
+
+# Classification quality
+cat("\n=== Classification Quality ===\n")
+cat("Mean max posterior probability:", 
+    round(mean(class_assignments$max_posterior_prob), 3), "\n")
+cat("Median max posterior probability:", 
+    round(median(class_assignments$max_posterior_prob), 3), "\n")
+cat("% with posterior prob > 0.7:", 
+    round(mean(class_assignments$max_posterior_prob > 0.7) * 100, 1), "%\n")
+cat("% with posterior prob > 0.9:", 
+    round(mean(class_assignments$max_posterior_prob > 0.9) * 100, 1), "%\n")
+
+# Distribution of max posterior probabilities
+hist(class_assignments$max_posterior_prob,
+     main = "Distribution of Maximum Posterior Probabilities",
+     xlab = "Max Posterior Probability",
+     col = "lightgreen",
+     breaks = 20)
+```
+
+# Within-Class Overdispersion Check
+
+This helps validate whether NB is needed or if Poisson would suffice.
+
+```{r within_class_overdispersion}
+cat("\n=== Within-Class Overdispersion Check ===\n\n")
+
+# Attach class assignments to full data
+trajectory_data <- gbtm_data %>%
+  left_join(class_assignments %>% select(patient_id, predicted_class), 
+            by = "patient_id") %>%
+  filter(!is.na(predicted_class))
+
+# For each class, calculate dispersion
+for (k in sort(unique(trajectory_data$predicted_class))) {
+  
+  class_data <- trajectory_data %>%
+    filter(predicted_class == k)
+  
+  mean_k <- mean(class_data$hospital_visits)
+  var_k <- var(class_data$hospital_visits)
+  dispersion_k <- var_k / mean_k
+  
+  cat("Class", k, ":\n")
+  cat("  N observations:", nrow(class_data), "\n")
+  cat("  Mean visits:", round(mean_k, 2), "\n")
+  cat("  Variance:", round(var_k, 2), "\n")
+  cat("  Dispersion ratio:", round(dispersion_k, 2), "\n")
+  
+  if (dispersion_k > 1.5) {
+    cat("  → Strong overdispersion (NB recommended)\n\n")
+  } else if (dispersion_k > 1.1) {
+    cat("  → Mild overdispersion (NB or Poisson acceptable)\n\n")
+  } else {
+    cat("  → No overdispersion (Poisson sufficient)\n\n")
+  }
+}
+```
+
+# Visualize Trajectories
+
+```{r visualize_trajectories, fig.width=12, fig.height=8}
+# Calculate mean trajectories by class
+mean_trajectories <- trajectory_data %>%
+  group_by(predicted_class, time) %>%
+  summarise(
+    n = n(),
+    mean_visits = mean(hospital_visits, na.rm = TRUE),
+    se_visits = sd(hospital_visits, na.rm = TRUE) / sqrt(n()),
+    lower_ci = mean_visits - 1.96 * se_visits,
+    upper_ci = mean_visits + 1.96 * se_visits,
+    .groups = "drop"
+  )
+
+# Sample patients to overlay individual trajectories
+set.seed(1008)
+sample_by_class <- trajectory_data %>%
+  group_by(predicted_class) %>%
+  slice_sample(n = 30) %>%
+  pull(patient_id)
+
+individual_trajectories <- trajectory_data %>%
+  filter(patient_id %in% sample_by_class)
+
+# Create plot
+ggplot() +
+  # Individual trajectories (faded)
+  geom_line(
+    data = individual_trajectories,
+    aes(x = time, y = hospital_visits, group = patient_id, color = factor(predicted_class)),
+    alpha = 0.3, linewidth = 0.3
+  ) +
+  # Confidence bands
+  geom_ribbon(
+    data = mean_trajectories,
+    aes(x = time, y = mean_visits, 
+        ymin = lower_ci, ymax = upper_ci, 
+        fill = factor(predicted_class)),
+    alpha = 0.3
+  ) +
+  # Mean trajectories (bold)
+  geom_line(
+    data = mean_trajectories,
+    aes(x = time, y = mean_visits, color = factor(predicted_class)),
+    linewidth = 1.5
+  ) +
+  scale_color_brewer(palette = "Set1", name = "Trajectory Class") +
+  scale_fill_brewer(palette = "Set1", name = "Trajectory Class") +
+  labs(
+    title = paste("Hospital Visit Trajectories by Latent Class (", 
+                  toupper(model_type), "GBTM)", sep = ""),
+    x = "Quarters Since Treatment",
+    y = "Number of Hospital Visits"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+# Trajectory characteristics summary
+cat("\n=== Trajectory Class Characteristics ===\n\n")
+for (class in sort(unique(mean_trajectories$predicted_class))) {
+  class_data <- mean_trajectories %>% filter(predicted_class == class)
+  initial_visits <- class_data$mean_visits[class_data$time == 0]
+  final_visits <- class_data$mean_visits[class_data$time == max(class_data$time)]
+  peak_visits <- max(class_data$mean_visits)
+  
+  cat("Class", class, ":\n")
+  cat("  - Initial visits (Q1):", round(initial_visits, 1), "\n")
+  cat("  - Final visits (Q20):", round(final_visits, 1), "\n")
+  cat("  - Peak visits:", round(peak_visits, 1), "\n")
+  cat("  - Pattern:", 
+      ifelse(initial_visits > final_visits, "Decreasing", 
+             ifelse(initial_visits < final_visits, "Increasing", "Stable")), 
+      "\n\n")
+}
+```
+
+# Characterize Classes by Demographics
+
+```{r class_characteristics}
+# Attach class assignments to patient demographics
+class_characteristics <- patient_demographics %>%
+  left_join(class_assignments %>% select(patient_id, predicted_class), 
+            by = "patient_id") %>%
+  filter(!is.na(predicted_class))
+
+cat("\n=== Demographic Characteristics by Class ===\n\n")
+
+# Age
+cat("--- Age ---\n")
+age_by_class <- class_characteristics %>%
+  group_by(predicted_class) %>%
+  summarise(
+    n = n(),
+    mean_age = round(mean(age, na.rm = TRUE), 1),
+    sd_age = round(sd(age, na.rm = TRUE), 1),
+    median_age = median(age, na.rm = TRUE),
+    .groups = "drop"
+  )
+print(age_by_class)
+
+# Sex
+cat("\n--- Sex Distribution (%) ---\n")
+sex_table <- prop.table(table(class_characteristics$predicted_class, 
+                              class_characteristics$sex), 1) * 100
+print(round(sex_table, 1))
+
+# BMI
+cat("\n--- BMI ---\n")
+bmi_by_class <- class_characteristics %>%
+  group_by(predicted_class) %>%
+  summarise(
+    n = n(),
+    mean_bmi = round(mean(bmi, na.rm = TRUE), 1),
+    sd_bmi = round(sd(bmi, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+print(bmi_by_class)
+
+# TB type
+cat("\n--- TB Type (%) ---\n")
+tb_type_table <- prop.table(table(class_characteristics$predicted_class, 
+                                 class_characteristics$tb_type), 1) * 100
+print(round(tb_type_table, 1))
+
+# Drug resistance
+cat("\n--- Drug Resistance (%) ---\n")
+dr_table <- prop.table(table(class_characteristics$predicted_class, 
+                            class_characteristics$drug_resistance), 1) * 100
+print(round(dr_table, 1))
+
+# Treatment outcome
+cat("\n--- Treatment Outcome (%) ---\n")
+outcome_table <- prop.table(table(class_characteristics$predicted_class, 
+                                 class_characteristics$treatment_outcome), 1) * 100
+print(round(outcome_table, 1))
+
+# CXR severity
+cat("\n--- Baseline CXR Severity ---\n")
+cxr_by_class <- class_characteristics %>%
+  group_by(predicted_class) %>%
+  summarise(
+    mean_cxr = round(mean(baseline_cxr_severity, na.rm = TRUE), 1),
+    sd_cxr = round(sd(baseline_cxr_severity, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+print(cxr_by_class)
+
+# Sputum smear
+cat("\n--- Baseline Sputum Smear (%) ---\n")
+sputum_table <- prop.table(table(class_characteristics$predicted_class, 
+                                 class_characteristics$baseline_sputum_smear), 1) * 100
+print(round(sputum_table, 1))
+```
+
+# Model Selection: Compare K=2 to K=6
+
+Systematically compare models with different numbers of classes.
+
+```{r model_selection}
+cat("\n=== Fitting Models with K=2 to K=5 ===\n")
+cat("(K=6 may take very long, adjust k_range if needed)\n\n")
+
+# Define range of k to test
+k_range <- 2:5  # Change to 2:6 if you have time
+
+# Store results
+model_comparison <- data.frame(
+  k = integer(),
+  loglik = numeric(),
+  aic = numeric(),
+  bic = numeric(),
+  converged = logical()
+)
+
+# Store models
+all_models <- list()
+
+# Fit models for each k
+for (k in k_range) {
+  
+  cat("\n--- Fitting k =", k, "---\n")
+  
+  model_k <- fit_gbtm(
+    data = gbtm_data,
+    k = k,
+    model_type = model_type
+  )
+  
+  if (!is.null(model_k)) {
+    all_models[[paste0("k", k)]] <- model_k
+    
+    model_comparison <- rbind(model_comparison, data.frame(
+      k = k,
+      loglik = logLik(model_k),
+      aic = AIC(model_k),
+      bic = BIC(model_k),
+      converged = TRUE
+    ))
+  } else {
+    cat("Model with k =", k, "failed to converge\n")
+    model_comparison <- rbind(model_comparison, data.frame(
+      k = k,
+      loglik = NA,
+      aic = NA,
+      bic = NA,
+      converged = FALSE
+    ))
+  }
+}
+
+# Display results
+cat("\n\n=== Model Comparison Results ===\n")
+print(model_comparison)
+
+# Identify best model
+if (any(!is.na(model_comparison$bic))) {
+  best_k <- model_comparison$k[which.min(model_comparison$bic)]
+  cat("\n*** Best model based on BIC: k =", best_k, "***\n")
+  
+  # Plot BIC vs k
+  plot(model_comparison$k, model_comparison$bic,
+       type = "b", pch = 19, col = "blue",
+       xlab = "Number of Classes (k)",
+       ylab = "BIC",
+       main = paste("Model Selection:", toupper(model_type), "GBTM"))
+  abline(v = best_k, col = "red", lty = 2)
+  text(best_k, min(model_comparison$bic, na.rm = TRUE), 
+       labels = paste("Best: k =", best_k), pos = 3, col = "red")
+}
+```
+
+# Validation Against True Classes (if available)
+
+If you have true trajectory groups from data generation, validate here.
+
+```{r validation, eval=FALSE}
+# Only run this if you have a 'trajectory_group' variable in patient_demographics
+
+if ("trajectory_group" %in% names(patient_demographics)) {
+  
+  validation_data <- class_characteristics %>%
+    select(patient_id, trajectory_group, predicted_class)
+  
+  # Create confusion matrix
+  # Note: You may need to remap predicted classes to true classes
+  # based on trajectory patterns (as you did in your original code)
+  
+  confusion_matrix <- table(
+    True = validation_data$trajectory_group,
+    Predicted = validation_data$predicted_class
+  )
+  
+  cat("\n=== Confusion Matrix ===\n")
+  print(confusion_matrix)
+  
+  # Overall accuracy
+  overall_accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+  cat("\nOverall accuracy:", round(overall_accuracy * 100, 1), "%\n")
+  
+  # Class-specific accuracy
+  class_accuracy <- diag(confusion_matrix) / rowSums(confusion_matrix)
+  cat("\nClass-specific accuracy:\n")
+  for (i in 1:length(class_accuracy)) {
+    cat("  True class", i, ":", round(class_accuracy[i] * 100, 1), "%\n")
+  }
+  
+  # Adjusted Rand Index
+  if (require(mclust, quietly = TRUE)) {
+    ari <- adjustedRandIndex(validation_data$trajectory_group, 
+                             validation_data$predicted_class)
+    cat("\nAdjusted Rand Index:", round(ari, 3), "\n")
+  }
+}
+```
+
+---
+
+# Custom ZINB Implementation (Advanced)
+
+Since flexmix doesn't natively support ZINB, here's a custom implementation template.
+This requires more manual coding but gives you full ZINB-GBTM capability.
+
+```{r custom_zinb, eval=FALSE}
+# ============================================================================
+# CUSTOM ZINB-GBTM IMPLEMENTATION
+# ============================================================================
+# This section shows how to implement ZINB-GBTM manually using EM algorithm
+# Set eval=TRUE in the chunk options to run this
+
+library(pscl)  # For zeroinfl function
+
+#' Custom ZINB-GBTM using EM algorithm
+#' 
+#' @param data Data frame with long format
+#' @param k Number of trajectory classes
+#' @param max_iter Maximum EM iterations
+#' @param tol Convergence tolerance
+fit_zinb_gbtm <- function(data, k = 4, max_iter = 100, tol = 1e-4) {
+  
+  cat("\n=== Custom ZINB-GBTM Implementation ===\n")
+  cat("This may take 30-60 minutes for large datasets\n\n")
+  
+  n_patients <- length(unique(data$patient_id))
+  patient_ids <- unique(data$patient_id)
+  
+  # Initialize: Assign patients randomly to classes
+  set.seed(1008)
+  class_init <- sample(1:k, n_patients, replace = TRUE)
+  posterior <- matrix(0, nrow = n_patients, ncol = k)
+  for (i in 1:n_patients) {
+    posterior[i, class_init[i]] <- 1
+  }
+  
+  # Store parameters
+  params <- list()
+  loglik_history <- c()
+  
+  # EM Algorithm
+  for (iter in 1:max_iter) {
+    
+    cat("Iteration", iter, "of", max_iter, "\n")
+    
+    ## M-Step: Fit ZINB model for each class
+    class_models <- list()
+    class_sizes <- colSums(posterior)
+    
+    for (j in 1:k) {
+      
+      # Weight observations by posterior probability
+      data_weighted <- data
+      data_weighted$weights <- posterior[match(data$patient_id, patient_ids), j]
+      
+      # Fit ZINB model with weights
+      tryCatch({
+        zinb_fit <- zeroinfl(
+          hospital_visits ~ time + I(time^2) | 1,  # count ~ predictors | zero-inflation
+          data = data_weighted,
+          weights = weights,
+          dist = "negbin"
+        )
+        class_models[[j]] <- zinb_fit
+      }, error = function(e) {
+        cat("  Warning: Class", j, "model failed\n")
+        class_models[[j]] <- NULL
+      })
+    }
+    
+    ## E-Step: Update posterior probabilities
+    log_likelihood <- 0
+    
+    for (i in 1:n_patients) {
+      patient_data <- data %>% filter(patient_id == patient_ids[i])
+      
+      # Calculate likelihood for each class
+      class_likelihoods <- rep(0, k)
+      
+      for (j in 1:k) {
+        if (!is.null(class_models[[j]])) {
+          # Predict likelihood of this patient's data under class j model
+          pred <- predict(class_models[[j]], newdata = patient_data, type = "prob")
+          # Sum log-likelihoods across time points
+          class_likelihoods[j] <- sum(log(pred[cbind(1:nrow(patient_data), 
+                                                      patient_data$hospital_visits + 1)]))
+        } else {
+          class_likelihoods[j] <- -Inf
+        }
+      }
+      
+      # Add class prior (mixing proportion)
+      class_log_posterior <- log(class_sizes / n_patients) + class_likelihoods
+      
+      # Normalize to get posterior probabilities
+      max_log_post <- max(class_log_posterior)
+      class_log_posterior <- class_log_posterior - max_log_post
+      class_posterior <- exp(class_log_posterior)
+      class_posterior <- class_posterior / sum(class_posterior)
+      
+      posterior[i, ] <- class_posterior
+      
+      # Accumulate log-likelihood
+      log_likelihood <- log_likelihood + max_log_post + log(sum(exp(class_log_posterior)))
+    }
+    
+    loglik_history <- c(loglik_history, log_likelihood)
+    cat("  Log-likelihood:", round(log_likelihood, 2), "\n")
+    
+    # Check convergence
+    if (iter > 1) {
+      improvement <- abs(loglik_history[iter] - loglik_history[iter - 1])
+      cat("  Improvement:", round(improvement, 4), "\n")
+      
+      if (improvement < tol) {
+        cat("\n*** Converged after", iter, "iterations ***\n")
+        break
+      }
+    }
+  }
+  
+  # Final class assignments
+  class_assignments <- apply(posterior, 1, which.max)
+  
+  # Return results
+  result <- list(
+    models = class_models,
+    posterior = posterior,
+    class_assignments = class_assignments,
+    patient_ids = patient_ids,
+    loglik = loglik_history[length(loglik_history)],
+    k = k,
+    converged = (iter < max_iter)
+  )
+  
+  class(result) <- "zinb_gbtm"
+  return(result)
+}
+
+# Example usage (on small subset for testing):
+# subset_data <- gbtm_data %>% filter(patient_id %in% unique(patient_id)[1:1000])
+# zinb_model <- fit_zinb_gbtm(subset_data, k = 4, max_iter = 20)
+```
+
+---
+
+# Summary and Recommendations
+
+```{r summary}
+cat("\n=================================================\n")
+cat("           ANALYSIS SUMMARY\n")
+cat("=================================================\n\n")
+
+cat("Model type used:", toupper(model_type), "\n")
+cat("Number of classes:", 4, "\n")
+cat("Total patients:", length(unique(gbtm_data$patient_id)), "\n")
+cat("Total observations:", nrow(gbtm_data), "\n\n")
+
+cat("Key findings:\n")
+cat("1. Overall zero rate:", round(zero_rate, 1), "%\n")
+cat("2. Overall dispersion ratio:", round(dispersion_overall, 2), "\n")
+cat("3. Mean classification certainty:", 
+    round(mean(class_assignments$max_posterior_prob), 3), "\n\n")
+
+cat("Recommendations:\n")
+if (dispersion_overall > 1.5) {
+  cat("• Use NB-GBTM (overdispersion detected)\n")
+} else {
+  cat("• Poisson-GBTM may be sufficient (mild overdispersion)\n")
+}
+
+if (mean(patient_zero_pattern$pct_zeros == 100) > 0.05) {
+  cat("• Consider ZINB-GBTM (structural zeros detected)\n")
+} else {
+  cat("• Zero-inflation models not necessary (no structural zeros)\n")
+}
+
+cat("\n=================================================\n")
+```
+
+# How to Switch Between Models
+
+To switch between different distributions:
+
+1. **Change the `model_type` variable** in the "Model Configuration" section:
+   - `"poisson"` - Standard Poisson GBTM
+   - `"nb"` - Negative Binomial GBTM (handles overdispersion)
+   - `"zip"` - Zero-Inflated Poisson GBTM
+   - `"zinb"` - Use custom implementation (see advanced section)
+
+2. **Re-run all chunks below the configuration**
+
+3. **Compare BIC values** between models to select the best fit
+
+## Model Selection Guide:
+
+- **Poisson**: Use if dispersion ratio ≈ 1.0 and no structural zeros
+- **NB**: Use if dispersion ratio > 1.5 (most common for healthcare data)
+- **ZIP**: Use if structural zeros present but no overdispersion (rare)
+- **ZINB**: Use if both structural zeros AND overdispersion present
+
+**Current recommendation based on diagnostics:** 
+Check the dispersion ratio output above. If > 1.5, use NB. If structural zeros 
+(patients with all zeros) > 5%, consider ZINB.
