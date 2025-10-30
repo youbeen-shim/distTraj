@@ -31,13 +31,21 @@ approach1 <- tryCatch({
 })
 
 if (!is.null(approach1)) {
-  cat("✓ SUCCESS\n")
-  cat("  Posterior dims:", nrow(posterior(approach1)), "x", ncol(posterior(approach1)), "\n")
-  cat("  Expected: 100 x 4\n")
-  cat("  Match:", nrow(posterior(approach1)) == 100, "\n\n")
+  post_rows <- nrow(posterior(approach1))
+  is_correct <- post_rows == 100
+  
+  if (is_correct) {
+    cat("✓ SUCCESS - CORRECT PATIENT-LEVEL CLUSTERING\n")
+  } else {
+    cat("✗ FAILED - WRONG GRANULARITY\n")
+  }
+  cat("  Posterior rows:", post_rows, "(expected: 100)\n")
+  cat("  Clustering at:", ifelse(is_correct, "PATIENT level ✓", "OBSERVATION level ✗"), "\n\n")
 } else {
-  cat("✗ FAILED\n\n")
+  cat("✗ FAILED - Model did not converge\n\n")
 }
+
+approach1_valid <- !is.null(approach1) && nrow(posterior(approach1)) == 100
 
 # ============================================================================
 # APPROACH 2: Long format with explicit factor(patient_id)
@@ -60,11 +68,21 @@ approach2 <- tryCatch({
 })
 
 if (!is.null(approach2)) {
-  cat("✓ SUCCESS\n")
-  cat("  Posterior dims:", nrow(posterior(approach2)), "x", ncol(posterior(approach2)), "\n\n")
+  post_rows <- nrow(posterior(approach2))
+  is_correct <- post_rows == 100
+  
+  if (is_correct) {
+    cat("✓ SUCCESS - CORRECT PATIENT-LEVEL CLUSTERING\n")
+  } else {
+    cat("✗ FAILED - WRONG GRANULARITY\n")
+  }
+  cat("  Posterior rows:", post_rows, "(expected: 100)\n")
+  cat("  Clustering at:", ifelse(is_correct, "PATIENT level ✓", "OBSERVATION level ✗"), "\n\n")
 } else {
-  cat("✗ FAILED\n\n")
+  cat("✗ FAILED - Model did not converge\n\n")
 }
+
+approach2_valid <- !is.null(approach2) && nrow(posterior(approach2)) == 100
 
 # ============================================================================
 # APPROACH 3: Long format with . ~ . | id syntax
@@ -92,11 +110,21 @@ approach3 <- tryCatch({
 })
 
 if (!is.null(approach3)) {
-  cat("✓ SUCCESS\n")
-  cat("  Posterior dims:", nrow(posterior(approach3)), "x", ncol(posterior(approach3)), "\n\n")
+  post_rows <- nrow(posterior(approach3))
+  is_correct <- post_rows == 100
+  
+  if (is_correct) {
+    cat("✓ SUCCESS - CORRECT PATIENT-LEVEL CLUSTERING\n")
+  } else {
+    cat("✗ FAILED - WRONG GRANULARITY\n")
+  }
+  cat("  Posterior rows:", post_rows, "(expected: 100)\n")
+  cat("  Clustering at:", ifelse(is_correct, "PATIENT level ✓", "OBSERVATION level ✗"), "\n\n")
 } else {
-  cat("✗ FAILED\n\n")
+  cat("✗ FAILED - Model did not converge\n\n")
 }
+
+approach3_valid <- !is.null(approach3) && nrow(posterior(approach3)) == 100
 
 # ============================================================================
 # APPROACH 4: Wide format with as.matrix()
@@ -125,11 +153,21 @@ approach4 <- tryCatch({
 })
 
 if (!is.null(approach4)) {
-  cat("✓ SUCCESS\n")
-  cat("  Posterior dims:", nrow(posterior(approach4)), "x", ncol(posterior(approach4)), "\n\n")
+  post_rows <- nrow(posterior(approach4))
+  is_correct <- post_rows == 100
+  
+  if (is_correct) {
+    cat("✓ SUCCESS - CORRECT PATIENT-LEVEL CLUSTERING\n")
+  } else {
+    cat("✗ FAILED - WRONG GRANULARITY\n")
+  }
+  cat("  Posterior rows:", post_rows, "(expected: 100)\n")
+  cat("  Clustering at:", ifelse(is_correct, "PATIENT level ✓", "OBSERVATION level ✗"), "\n\n")
 } else {
-  cat("✗ FAILED\n\n")
+  cat("✗ FAILED - Model did not converge\n\n")
 }
+
+approach4_valid <- !is.null(approach4) && nrow(posterior(approach4)) == 100
 
 # ============================================================================
 # APPROACH 5: Long format with FLXMRglmfix (fixed/varying coefficients)
@@ -152,11 +190,21 @@ approach5 <- tryCatch({
 })
 
 if (!is.null(approach5)) {
-  cat("✓ SUCCESS\n")
-  cat("  Posterior dims:", nrow(posterior(approach5)), "x", ncol(posterior(approach5)), "\n\n")
+  post_rows <- nrow(posterior(approach5))
+  is_correct <- post_rows == 100
+  
+  if (is_correct) {
+    cat("✓ SUCCESS - CORRECT PATIENT-LEVEL CLUSTERING\n")
+  } else {
+    cat("✗ FAILED - WRONG GRANULARITY\n")
+  }
+  cat("  Posterior rows:", post_rows, "(expected: 100)\n")
+  cat("  Clustering at:", ifelse(is_correct, "PATIENT level ✓", "OBSERVATION level ✗"), "\n\n")
 } else {
-  cat("✗ FAILED\n\n")
+  cat("✗ FAILED - Model did not converge\n\n")
 }
+
+approach5_valid <- !is.null(approach5) && nrow(posterior(approach5)) == 100
 
 # ============================================================================
 # APPROACH 6: Aggregate to patient level first
@@ -195,12 +243,21 @@ approach6 <- tryCatch({
 })
 
 if (!is.null(approach6)) {
-  cat("✓ SUCCESS\n")
-  cat("  Posterior dims:", nrow(posterior(approach6)), "x", ncol(posterior(approach6)), "\n")
+  post_rows <- nrow(posterior(approach6))
+  is_correct <- post_rows == 100
+  
+  if (is_correct) {
+    cat("✓ SUCCESS - CORRECT PATIENT-LEVEL CLUSTERING\n")
+  } else {
+    cat("✗ FAILED - WRONG GRANULARITY\n")
+  }
+  cat("  Posterior rows:", post_rows, "(expected: 100)\n")
   cat("  Note: This doesn't model trajectories directly!\n\n")
 } else {
-  cat("✗ FAILED\n\n")
+  cat("✗ FAILED - Model did not converge\n\n")
 }
+
+approach6_valid <- !is.null(approach6) && nrow(posterior(approach6)) == 100
 
 # ============================================================================
 # APPROACH 7: Use stepFlexmix wrapper
@@ -226,11 +283,21 @@ approach7 <- tryCatch({
 })
 
 if (!is.null(approach7)) {
-  cat("✓ SUCCESS\n")
-  cat("  Posterior dims:", nrow(posterior(approach7)), "x", ncol(posterior(approach7)), "\n\n")
+  post_rows <- nrow(posterior(approach7))
+  is_correct <- post_rows == 100
+  
+  if (is_correct) {
+    cat("✓ SUCCESS - CORRECT PATIENT-LEVEL CLUSTERING\n")
+  } else {
+    cat("✗ FAILED - WRONG GRANULARITY\n")
+  }
+  cat("  Posterior rows:", post_rows, "(expected: 100)\n")
+  cat("  Clustering at:", ifelse(is_correct, "PATIENT level ✓", "OBSERVATION level ✗"), "\n\n")
 } else {
-  cat("✗ FAILED\n\n")
+  cat("✗ FAILED - Model did not converge\n\n")
 }
+
+approach7_valid <- !is.null(approach7) && nrow(posterior(approach7)) == 100
 
 # ============================================================================
 # APPROACH 8: Manually reshape and use simple regression mixture
@@ -265,11 +332,21 @@ approach8 <- tryCatch({
 })
 
 if (!is.null(approach8)) {
-  cat("✓ SUCCESS\n")
-  cat("  Posterior dims:", nrow(posterior(approach8)), "x", ncol(posterior(approach8)), "\n\n")
+  post_rows <- nrow(posterior(approach8))
+  is_correct <- post_rows == 100
+  
+  if (is_correct) {
+    cat("✓ SUCCESS - CORRECT PATIENT-LEVEL CLUSTERING\n")
+  } else {
+    cat("✗ FAILED - WRONG GRANULARITY\n")
+  }
+  cat("  Posterior rows:", post_rows, "(expected: 100)\n")
+  cat("  Clustering at:", ifelse(is_correct, "PATIENT level ✓", "OBSERVATION level ✗"), "\n\n")
 } else {
-  cat("✗ FAILED\n\n")
+  cat("✗ FAILED - Model did not converge\n\n")
 }
+
+approach8_valid <- !is.null(approach8) && nrow(posterior(approach8)) == 100
 
 # ============================================================================
 # SUMMARY
@@ -289,7 +366,7 @@ results <- data.frame(
     "stepFlexmix wrapper",
     "Reshape multivariate"
   ),
-  Success = c(
+  Converged = c(
     !is.null(approach1),
     !is.null(approach2),
     !is.null(approach3),
@@ -299,25 +376,41 @@ results <- data.frame(
     !is.null(approach7),
     !is.null(approach8)
   ),
+  Patient_Level = c(
+    approach1_valid,
+    approach2_valid,
+    approach3_valid,
+    approach4_valid,
+    approach5_valid,
+    approach6_valid,
+    approach7_valid,
+    approach8_valid
+  ),
   Likelihood = c(85, 75, 70, 60, 50, 40, 65, 30)
 )
 
 print(results)
 
 cat("\n")
-if (any(results$Success)) {
-  cat("✓ Working approaches:", paste(which(results$Success), collapse = ", "), "\n")
+if (any(results$Patient_Level)) {
+  valid_approaches <- which(results$Patient_Level)
+  cat("✓✓✓ CORRECT APPROACHES (patient-level clustering):", 
+      paste(valid_approaches, collapse = ", "), "\n\n")
   
   # Identify the best working approach
-  best <- which(results$Success)[1]
-  cat("\nRECOMMENDED: Use Approach", best, "-", results$Method[best], "\n")
+  best <- valid_approaches[1]
+  cat("RECOMMENDED: Use Approach", best, "-", results$Method[best], "\n\n")
   
   # Show how to access the working model
-  cat("\nTo use the working model:\n")
-  cat("model <- approach", best, "\n", sep = "")
-  cat("posterior_probs <- posterior(model)\n")
-  cat("cluster_assignments <- clusters(model)\n")
+  cat("To use the working model:\n")
+  cat("  model <- approach", best, "\n", sep = "")
+  cat("  posterior_probs <- posterior(model)  # 100 x 4 matrix\n")
+  cat("  cluster_assignments <- clusters(model)  # 100-length vector\n\n")
   
+} else if (any(results$Converged)) {
+  cat("⚠ Some models converged but are clustering at OBSERVATION level (not patient level)\n")
+  cat("  This means they're treating each row as independent, not grouping by patient\n\n")
+  cat("RECOMMENDATION: Use the latrend package wrapper instead\n")
 } else {
   cat("✗ None of the approaches worked!\n")
   cat("\nPossible issues:\n")
@@ -326,4 +419,3 @@ if (any(results$Success)) {
   cat("3. Missing dependencies\n")
   cat("\nRECOMMENDATION: Use the latrend package wrapper instead\n")
 }
-
