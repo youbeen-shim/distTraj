@@ -64,7 +64,6 @@ cat("Time range:", min(gbtm_data$time), "to", max(gbtm_data$time), "\n")
 # Exploratory Analysis
 
 ## Spaghetti Plot
-
 ```{r spaghetti_plot, fig.width=10, fig.height=6}
 set.seed(1008)
 sample_patients <- gbtm_data %>%
@@ -73,6 +72,9 @@ sample_patients <- gbtm_data %>%
   pull(patient_id)
 
 spaghetti_data <- gbtm_data %>%
+  filter(patient_id %in% sample_patients)
+
+test_data <- gbtm_data %>%
   filter(patient_id %in% sample_patients)
 
 ggplot(spaghetti_data, aes(x = time, y = hospital_visits, group = patient_id)) +
@@ -86,59 +88,43 @@ ggplot(spaghetti_data, aes(x = time, y = hospital_visits, group = patient_id)) +
   theme_minimal()
 ```
 
-## Distribution Diagnostics
 
-```{r distribution_diagnostics}
-# Overall zero rate
-zero_rate <- mean(gbtm_data$hospital_visits == 0) * 100
-cat("Overall zero rate:", round(zero_rate, 1), "%\n\n")
+```{r}
+colnames(test_data)
 
-# Overdispersion check (overall)
-mean_visits <- mean(gbtm_data$hospital_visits)
-var_visits <- var(gbtm_data$hospital_visits)
-dispersion_overall <- var_visits / mean_visits
+model <- flexmix(
+  hospital_visits ~ time + I(time^2) | patient_id,
+  data = test_data,  
+  k = 4,
+  model = FLXMRglm(family = "poisson")
+)
 
-cat("Overall statistics:\n")
-cat("  Mean:", round(mean_visits, 2), "\n")
-cat("  Variance:", round(var_visits, 2), "\n")
-cat("  Dispersion ratio (Var/Mean):", round(dispersion_overall, 2), "\n\n")
+post_probs <- posterior(model)
+nrow(post_probs)
+```
 
-if (dispersion_overall > 1.5) {
-  cat("CONCLUSION: Strong overdispersion → Use NB or ZINB\n")
-} else if (dispersion_overall > 1.1) {
-  cat("CONCLUSION: Moderate overdispersion → NB recommended\n")
-} else {
-  cat("CONCLUSION: No overdispersion → Poisson or ZIP acceptable\n")
-}
-
-# Check for structural zeros (patients with ALL zeros)
-patient_zero_pattern <- gbtm_data %>%
-  group_by(patient_id) %>%
-  summarise(
-    total_quarters = n(),
-    zero_quarters = sum(hospital_visits == 0),
-    pct_zeros = zero_quarters / total_quarters * 100,
-    max_visits = max(hospital_visits)
+```{r}
+wide_data <- test_data %>%
+  pivot_wider(
+    id_cols = patient_id,    
+    names_from = time,
+    values_from = hospital_visits,
+    names_prefix = "t") %>%
+  left_join(
+    test_data %>% dplyr::select(patient_id, age, sex, bmi) %>% slice(1),
+    by = "patient_id"
   )
 
-cat("\n\nZero pattern by patient:\n")
-cat("  Patients with ALL zeros:", 
-    sum(patient_zero_pattern$pct_zeros == 100), 
-    "(", round(mean(patient_zero_pattern$pct_zeros == 100) * 100, 1), "%)\n")
-cat("  Patients with SOME zeros:", 
-    sum(patient_zero_pattern$pct_zeros > 0 & patient_zero_pattern$pct_zeros < 100),
-    "(", round(mean(patient_zero_pattern$pct_zeros > 0 & patient_zero_pattern$pct_zeros < 100) * 100, 1), "%)\n")
-cat("  Patients with NO zeros:", 
-    sum(patient_zero_pattern$pct_zeros == 0),
-    "(", round(mean(patient_zero_pattern$pct_zeros == 0) * 100, 1), "%)\n")
-
-# Histogram of zero percentage distribution
-hist(patient_zero_pattern$pct_zeros,
-     main = "Distribution of % Zero Quarters per Patient",
-     xlab = "% of Quarters with Zero Visits",
-     col = "lightblue",
-     breaks = 20)
+model_poisson <- flexmix(
+  cbind(t0, t1, t2, t3, t4, t5, t6, t7, t8, t9,
+        t10, t11, t12, t13, t14, t15, t16, t17, t18, t19) ~ 1,
+  k = 4,
+  model = FLXMRglm(family = "poisson"),
+  control = list(minprior = 0.05, iter.max = 500, verbose = 1),
+  data = wide_data
+)
 ```
+
 
 # Model Configuration
 
